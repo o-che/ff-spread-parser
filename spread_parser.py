@@ -9,8 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 SYMBOL = "FFUSDT"
 SPOT_URL          = f"https://api.binance.com/api/v3/ticker/price?symbol={SYMBOL}"
 FUTURES_URL       = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={SYMBOL}"
-SPOT_DEPTH_URL    = f"https://api.binance.com/api/v3/depth?symbol={SYMBOL}&limit=100"
-FUTURES_DEPTH_URL = f"https://fapi.binance.com/fapi/v1/depth?symbol={SYMBOL}&limit=100"
+SPOT_DEPTH_URL    = f"https://api.binance.com/api/v3/depth?symbol={SYMBOL}&limit=1000"
+FUTURES_DEPTH_URL = f"https://fapi.binance.com/fapi/v1/depth?symbol={SYMBOL}&limit=1000"
 
 TG_TOKEN = os.environ["TG_TOKEN"]
 TG_URL   = f"https://api.telegram.org/bot{TG_TOKEN}"
