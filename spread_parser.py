@@ -29,7 +29,10 @@ def load_stats():
     if os.path.exists(STATS_FILE):
         with open(STATS_FILE) as f:
             return json.load(f)
-    return {"spot": {"total": 0, "correct": 0}}
+    return {
+        "spot":    {"total": 0, "correct": 0},
+        "futures": {"total": 0, "correct": 0},
+    }
 
 
 def save_stats(stats):
@@ -37,9 +40,9 @@ def save_stats(stats):
         json.dump(stats, f)
 
 
-def accuracy_line(stats):
-    t = stats["spot"]["total"]
-    c = stats["spot"]["correct"]
+def accuracy_line(stats, market):
+    t = stats[market]["total"]
+    c = stats[market]["correct"]
     if t == 0:
         return "нет данных"
     return f"{c}/{t} ({c/t*100:.0f}%)"
@@ -102,41 +105,48 @@ def send_telegram(text):
 
 # ── Проверка результата через 10 секунд ───────────────────────────────────────
 
-def check_result(signal, price_at_signal, stats):
+def check_result(spot_sig, spot_price, fut_sig, fut_price, stats):
     time.sleep(CHECK_DELAY)
     try:
-        current_price = get_spot()
-        correct = (signal == "buy" and current_price > price_at_signal) or \
-                  (signal == "sell" and current_price < price_at_signal)
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_spot = ex.submit(get_spot)
+            f_fut  = ex.submit(get_futures)
+            cur_spot = f_spot.result()
+            cur_fut  = f_fut.result()
+
+        def evaluate(sig, old_p, cur_p, market):
+            correct = (sig == "buy" and cur_p > old_p) or \
+                      (sig == "sell" and cur_p < old_p)
+            stats[market]["total"] += 1
+            if correct:
+                stats[market]["correct"] += 1
+            return correct
+
+        LABEL = {"buy": "🟢 ПОКУПКА", "sell": "🔴 ПРОДАЖА", "balance": "⚪️ баланс"}
 
         with stats_lock:
-            stats["spot"]["total"] += 1
-            if correct:
-                stats["spot"]["correct"] += 1
+            spot_ok = evaluate(spot_sig, spot_price, cur_spot, "spot")
+            fut_ok  = evaluate(fut_sig,  fut_price,  cur_fut,  "futures")
             save_stats(stats)
-            acc = accuracy_line(stats)
+            acc_spot = accuracy_line(stats, "spot")
+            acc_fut  = accuracy_line(stats, "futures")
 
-        diff = current_price - price_at_signal
-        diff_pct = diff / price_at_signal * 100
-        diff_sign = "+" if diff >= 0 else ""
+        def result_row(ok, sig, old_p, cur_p, market_name, acc):
+            verdict = "✅ отыграло" if ok else "❌ не отыграло"
+            diff_pct = (cur_p - old_p) / old_p * 100
+            diff_sign = "+" if diff_pct >= 0 else ""
+            return (
+                f"<b>{market_name}:</b> {LABEL[sig]} → {verdict}\n"
+                f"  {old_p:.6f} → {cur_p:.6f} ({diff_sign}{diff_pct:.4f}%)\n"
+                f"  📊 Точность: <b>{acc}</b>"
+            )
 
-        if correct:
-            verdict = "✅ <b>ОТЫГРАЛО</b>"
-        else:
-            verdict = "❌ <b>НЕ ОТЫГРАЛО</b>"
+        spot_row = result_row(spot_ok, spot_sig, spot_price, cur_spot, "Спот",    acc_spot)
+        fut_row  = result_row(fut_ok,  fut_sig,  fut_price,  cur_fut,  "Фьючерс", acc_fut)
 
-        signal_label = "🟢 ПОКУПКА" if signal == "buy" else "🔴 ПРОДАЖА"
-
-        msg = (
-            f"{verdict}\n\n"
-            f"Колл: {signal_label}\n"
-            f"Цена при колле: <code>{price_at_signal:.6f}</code>\n"
-            f"Цена через {CHECK_DELAY}с:  <code>{current_price:.6f}</code>\n"
-            f"Движение: <b>{diff_sign}{diff_pct:.4f}%</b>\n\n"
-            f"📊 Точность коллов: <b>{acc}</b>"
-        )
+        msg = f"⏱ <b>Результат через {CHECK_DELAY}с</b>\n\n{spot_row}\n\n{fut_row}"
         send_telegram(msg)
-        print(f"[check] signal={signal} was={'correct' if correct else 'wrong'} acc={acc}")
+        print(f"[check] spot={'ok' if spot_ok else 'no'} fut={'ok' if fut_ok else 'no'}")
 
     except Exception as e:
         print(f"[check] Error: {e}")
@@ -182,7 +192,7 @@ def build_message(spot, futures, spread_pct,
         f"{spread_arrow} Спред: <b>{spread_sign}{spread_pct:.4f}%</b>{spread_label}\n\n"
         f"{spot_block}\n\n"
         f"{fut_block}\n\n"
-        f"📊 Точность коллов: <b>{accuracy_line(stats)}</b>\n"
+        f"📊 Точность спот: <b>{accuracy_line(stats, 'spot')}</b> | фьючерс: <b>{accuracy_line(stats, 'futures')}</b>\n"
         f"⏱ Результат через {CHECK_DELAY} сек..."
     )
 
@@ -223,7 +233,7 @@ def main():
                 # Запускаем проверку результата в фоне
                 threading.Thread(
                     target=check_result,
-                    args=(spot_sig, spot, stats),
+                    args=(spot_sig, spot, fut_sig, futures, stats),
                     daemon=True
                 ).start()
 
