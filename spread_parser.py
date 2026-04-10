@@ -17,7 +17,7 @@ TG_URL = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
 BOOK_DEPTH = 3.0       # анализируем ±3% от цены
 SIGNAL_PCT = 60.0      # порог для колла (%)
-COOLDOWN   = 60        # минимум секунд между алертами
+COOLDOWN   = 10        # минимум секунд между алертами
 STATS_FILE = "stats.json"
 
 LABEL = {"buy": "🟢 ПОКУПКА", "sell": "🔴 ПРОДАЖА", "balance": "⚪️ баланс"}
