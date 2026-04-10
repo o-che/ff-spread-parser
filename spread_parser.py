@@ -12,7 +12,7 @@ TG_TOKEN = os.environ["TG_TOKEN"]
 TG_CHAT_ID = os.environ["TG_CHAT_ID"]
 TG_URL = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
-THRESHOLD = 0.5  # алерт при изменении спреда на 0.5%
+THRESHOLD = 1.0  # алерт при изменении спреда на 1%
 
 
 def get_spot():
