@@ -15,8 +15,8 @@ TG_TOKEN = os.environ["TG_TOKEN"]
 TG_CHAT_ID = os.environ["TG_CHAT_ID"]
 TG_URL = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
-THRESHOLD = 1.0
-BOOK_DEPTH = 2.0
+BOOK_DEPTH = 2.0       # анализируем ±2% от цены
+SIGNAL_PCT = 60.0      # порог для колла (%)
 STATS_FILE = "stats.json"
 
 
@@ -38,7 +38,6 @@ def save_stats(stats):
 
 
 def record_result(stats, market, signal, prev_price, curr_price):
-    """Записывает был ли предыдущий колл правильным."""
     if signal in ("buy", "sell"):
         correct = (signal == "buy" and curr_price > prev_price) or \
                   (signal == "sell" and curr_price < prev_price)
@@ -80,10 +79,10 @@ def get_orderbook(url):
 
 def get_all_data():
     with ThreadPoolExecutor(max_workers=4) as ex:
-        f_spot     = ex.submit(get_spot)
-        f_futures  = ex.submit(get_futures)
-        f_spot_bk  = ex.submit(get_orderbook, SPOT_DEPTH_URL)
-        f_fut_bk   = ex.submit(get_orderbook, FUTURES_DEPTH_URL)
+        f_spot    = ex.submit(get_spot)
+        f_futures = ex.submit(get_futures)
+        f_spot_bk = ex.submit(get_orderbook, SPOT_DEPTH_URL)
+        f_fut_bk  = ex.submit(get_orderbook, FUTURES_DEPTH_URL)
         return f_spot.result(), f_futures.result(), f_spot_bk.result(), f_fut_bk.result()
 
 
@@ -95,12 +94,17 @@ def analyze_book(book, mid_price):
     return bid_vol, ask_vol
 
 
-def get_signal_key(bid_vol, ask_vol):
-    if bid_vol > ask_vol * 1.2:
-        return "buy"
-    elif ask_vol > bid_vol * 1.2:
-        return "sell"
-    return "balance"
+def get_signal(bid_vol, ask_vol):
+    total = bid_vol + ask_vol
+    if total == 0:
+        return "balance", 50.0, 50.0
+    bid_pct = bid_vol / total * 100
+    ask_pct = ask_vol / total * 100
+    if bid_pct >= SIGNAL_PCT:
+        return "buy", bid_pct, ask_pct
+    elif ask_pct >= SIGNAL_PCT:
+        return "sell", bid_pct, ask_pct
+    return "balance", bid_pct, ask_pct
 
 
 def send_telegram(text):
@@ -111,86 +115,69 @@ def send_telegram(text):
 # ── Сообщение ─────────────────────────────────────────────────────────────────
 
 SIGNAL_LABEL = {
-    "buy":     "🟢 покупка",
-    "sell":    "🔴 продажа",
+    "buy":     "🟢 ПОКУПКА",
+    "sell":    "🔴 ПРОДАЖА",
     "balance": "⚪️ баланс",
 }
 
 
-def book_block(bid_vol, ask_vol, signal_key, prev_result, acc_line, title):
-    total = bid_vol + ask_vol
-    bid_pct = bid_vol / total * 100 if total else 0
-    ask_pct = ask_vol / total * 100 if total else 0
+def build_message(spot, futures, spread_pct,
+                  spot_bid, spot_ask, spot_sig, spot_bid_pct, spot_ask_pct,
+                  fut_bid, fut_ask, fut_sig, fut_bid_pct, fut_ask_pct,
+                  spot_prev_result, fut_prev_result, stats, now):
 
-    if prev_result is None:
-        result_line = "  ↩️ Предыдущий колл: <i>первый</i>"
-    elif prev_result:
-        result_line = "  ✅ Предыдущий колл: <b>верный</b>"
-    else:
-        result_line = "  ❌ Предыдущий колл: <b>неверный</b>"
-
-    return (
-        f"<b>{title} (±2%):</b>\n"
-        f"  🟢 Биды: <code>${bid_vol:,.0f}</code> ({bid_pct:.0f}%)\n"
-        f"  🔴 Аски: <code>${ask_vol:,.0f}</code> ({ask_pct:.0f}%)\n"
-        f"  → {SIGNAL_LABEL[signal_key]}\n"
-        f"{result_line}\n"
-        f"  📊 Точность: <b>{acc_line}</b>"
-    )
-
-
-def build_message(spot, futures, spread_pct, prev_spread_pct,
-                  spot_book, fut_book, stats,
-                  spot_prev_result, fut_prev_result, now):
-
-    sign  = "+" if spread_pct >= 0 else ""
-    arrow = "🔼" if spread_pct > 0 else ("🔽" if spread_pct < 0 else "➡️")
-
-    if prev_spread_pct is None:
-        change_line = "📊 Изменение спреда: <i>первый запуск</i>"
-    else:
-        delta = spread_pct - prev_spread_pct
-        delta_sign = "+" if delta >= 0 else ""
-        change_arrow = "📈" if delta > 0 else ("📉" if delta < 0 else "➡️")
-        change_line = f"{change_arrow} Изменение спреда: <b>{delta_sign}{delta:.4f}%</b>"
+    spread_sign  = "+" if spread_pct >= 0 else ""
+    spread_arrow = "🔼" if spread_pct > 0 else ("🔽" if spread_pct < 0 else "➡️")
 
     if spread_pct > 4.0:
-        label = "\n⚠️ <b>СПРЕД ВЫСОКИЙ (&gt;4%)</b>"
+        spread_label = "  ⚠️ спред высокий"
     elif spread_pct < 0:
-        label = "\n🔵 <b>СПРЕД ОТРИЦАТЕЛЬНЫЙ</b>"
+        spread_label = "  🔵 спред отрицательный"
     else:
-        label = ""
+        spread_label = ""
 
-    spot_bid, spot_ask   = analyze_book(spot_book, spot)
-    fut_bid,  fut_ask    = analyze_book(fut_book,  futures)
-    spot_sig = get_signal_key(spot_bid, spot_ask)
-    fut_sig  = get_signal_key(fut_bid,  fut_ask)
+    def result_line(res):
+        if res is None:   return "  ↩️ Предыдущий колл: <i>первый</i>"
+        if res:           return "  ✅ Предыдущий колл: <b>верный</b>"
+        return               "  ❌ Предыдущий колл: <b>неверный</b>"
 
-    spot_block = book_block(spot_bid, spot_ask, spot_sig,
-                            spot_prev_result, accuracy_line(stats, "spot"), "Спот")
-    fut_block  = book_block(fut_bid,  fut_ask,  fut_sig,
-                            fut_prev_result,  accuracy_line(stats, "futures"), "Фьючерс")
+    spot_block = (
+        f"<b>Спот стакан (±2%):</b>\n"
+        f"  🟢 Биды: <code>${spot_bid:,.0f}</code> ({spot_bid_pct:.0f}%)\n"
+        f"  🔴 Аски: <code>${spot_ask:,.0f}</code> ({spot_ask_pct:.0f}%)\n"
+        f"  → {SIGNAL_LABEL[spot_sig]}\n"
+        f"{result_line(spot_prev_result)}\n"
+        f"  📊 Точность: <b>{accuracy_line(stats, 'spot')}</b>"
+    )
+
+    fut_block = (
+        f"<b>Фьючерс стакан (±2%):</b>\n"
+        f"  🟢 Биды: <code>${fut_bid:,.0f}</code> ({fut_bid_pct:.0f}%)\n"
+        f"  🔴 Аски: <code>${fut_ask:,.0f}</code> ({fut_ask_pct:.0f}%)\n"
+        f"  → {SIGNAL_LABEL[fut_sig]}\n"
+        f"{result_line(fut_prev_result)}\n"
+        f"  📊 Точность: <b>{accuracy_line(stats, 'futures')}</b>"
+    )
 
     return (
-        f"🟡 <b>FF Spread (Binance) — {now}</b>\n\n"
+        f"🟡 <b>FF — {now}</b>\n\n"
         f"Спот:     <code>{spot:.6f}</code>\n"
-        f"Фьючерс: <code>{futures:.6f}</code>\n\n"
-        f"{arrow} Спред: <b>{sign}{spread_pct:.4f}%</b>\n"
-        f"{change_line}{label}\n\n"
+        f"Фьючерс: <code>{futures:.6f}</code>\n"
+        f"{spread_arrow} Спред: <b>{spread_sign}{spread_pct:.4f}%</b>{spread_label}\n\n"
         f"{spot_block}\n\n"
         f"{fut_block}"
-    ), spot_sig, fut_sig
+    )
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     print("Starting FF spread parser...")
-    stats          = load_stats()
-    prev_spread    = None
-    prev_spot_sig  = None
-    prev_fut_sig   = None
+    stats = load_stats()
+
+    prev_spot_sig   = None
     prev_spot_price = None
+    prev_fut_sig    = None
     prev_fut_price  = None
 
     while True:
@@ -200,9 +187,16 @@ def main():
             spread_pct = ((spot - futures) / avg) * 100
             now        = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            if prev_spread is None or abs(spread_pct - prev_spread) >= THRESHOLD:
+            spot_bid, spot_ask = analyze_book(spot_book, spot)
+            fut_bid,  fut_ask  = analyze_book(fut_book,  futures)
 
-                # Проверяем предыдущие коллы
+            spot_sig, spot_bid_pct, spot_ask_pct = get_signal(spot_bid, spot_ask)
+            fut_sig,  fut_bid_pct,  fut_ask_pct  = get_signal(fut_bid,  fut_ask)
+
+            # Триггер: сигнал спота изменился И он не "balance"
+            trigger = spot_sig != "balance" and spot_sig != prev_spot_sig
+
+            if trigger:
                 spot_prev_result = None
                 fut_prev_result  = None
 
@@ -214,22 +208,21 @@ def main():
                     fut_prev_result = record_result(
                         stats, "futures", prev_fut_sig, prev_fut_price, futures)
 
-                msg, spot_sig, fut_sig = build_message(
-                    spot, futures, spread_pct, prev_spread,
-                    spot_book, fut_book, stats,
-                    spot_prev_result, fut_prev_result, now
+                msg = build_message(
+                    spot, futures, spread_pct,
+                    spot_bid, spot_ask, spot_sig, spot_bid_pct, spot_ask_pct,
+                    fut_bid,  fut_ask,  fut_sig,  fut_bid_pct,  fut_ask_pct,
+                    spot_prev_result, fut_prev_result, stats, now
                 )
                 send_telegram(msg)
-                print(f"[{now}] spread={spread_pct:+.4f}% spot_sig={spot_sig} fut_sig={fut_sig} — отправлено")
+                print(f"[{now}] spread={spread_pct:+.4f}% spot={spot_sig}({spot_bid_pct:.0f}%b) — отправлено")
 
-                prev_spread     = spread_pct
                 prev_spot_sig   = spot_sig
-                prev_fut_sig    = fut_sig
                 prev_spot_price = spot
+                prev_fut_sig    = fut_sig
                 prev_fut_price  = futures
-
             else:
-                print(f"[{now}] spread={spread_pct:+.4f}% — пропущено")
+                print(f"[{now}] spread={spread_pct:+.4f}% spot={spot_sig}({spot_bid_pct:.0f}%b) fut={fut_sig} — пропущено")
 
         except requests.RequestException as e:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {e}")
