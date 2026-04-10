@@ -55,12 +55,20 @@ def build_message(spot, futures, spread_pct, prev_spread_pct, now):
         change_arrow = "📈" if delta > 0 else ("📉" if delta < 0 else "➡️")
         change_line = f"{change_arrow} Изменение спреда: <b>{delta_sign}{delta:.4f}%</b>"
 
+    if spread_pct > 4.0:
+        label = "⚠️ <b>СПРЕД ВЫСОКИЙ (&gt;4%)</b>"
+    elif spread_pct < 0:
+        label = "🔵 <b>СПРЕД ОТРИЦАТЕЛЬНЫЙ</b>"
+    else:
+        label = ""
+
     return (
         f"🟡 <b>FF Spread (Binance) — {now}</b>\n\n"
         f"Спот:     <code>{spot:.6f}</code>\n"
         f"Фьючерс: <code>{futures:.6f}</code>\n\n"
         f"{arrow} Спред: <b>{sign}{spread_pct:.4f}%</b>\n"
         f"{change_line}"
+        + (f"\n\n{label}" if label else "")
     )
 
 
