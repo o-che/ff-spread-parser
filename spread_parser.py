@@ -2,6 +2,7 @@ import requests
 import time
 import os
 import json
+import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
@@ -15,9 +16,11 @@ TG_TOKEN = os.environ["TG_TOKEN"]
 TG_CHAT_ID = os.environ["TG_CHAT_ID"]
 TG_URL = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
-BOOK_DEPTH = 2.0       # анализируем ±2% от цены
-SIGNAL_PCT = 60.0      # порог для колла (%)
+BOOK_DEPTH = 2.0
+SIGNAL_PCT = 60.0
+CHECK_DELAY = 10       # секунд до проверки результата
 STATS_FILE = "stats.json"
+stats_lock = threading.Lock()
 
 
 # ── Статистика ────────────────────────────────────────────────────────────────
@@ -26,10 +29,7 @@ def load_stats():
     if os.path.exists(STATS_FILE):
         with open(STATS_FILE) as f:
             return json.load(f)
-    return {
-        "spot":    {"total": 0, "correct": 0},
-        "futures": {"total": 0, "correct": 0},
-    }
+    return {"spot": {"total": 0, "correct": 0}}
 
 
 def save_stats(stats):
@@ -37,21 +37,9 @@ def save_stats(stats):
         json.dump(stats, f)
 
 
-def record_result(stats, market, signal, prev_price, curr_price):
-    if signal in ("buy", "sell"):
-        correct = (signal == "buy" and curr_price > prev_price) or \
-                  (signal == "sell" and curr_price < prev_price)
-        stats[market]["total"] += 1
-        if correct:
-            stats[market]["correct"] += 1
-        save_stats(stats)
-        return correct
-    return None
-
-
-def accuracy_line(stats, market):
-    t = stats[market]["total"]
-    c = stats[market]["correct"]
+def accuracy_line(stats):
+    t = stats["spot"]["total"]
+    c = stats["spot"]["correct"]
     if t == 0:
         return "нет данных"
     return f"{c}/{t} ({c/t*100:.0f}%)"
@@ -112,19 +100,54 @@ def send_telegram(text):
     requests.post(TG_URL, json=payload, timeout=10)
 
 
+# ── Проверка результата через 10 секунд ───────────────────────────────────────
+
+def check_result(signal, price_at_signal, stats):
+    time.sleep(CHECK_DELAY)
+    try:
+        current_price = get_spot()
+        correct = (signal == "buy" and current_price > price_at_signal) or \
+                  (signal == "sell" and current_price < price_at_signal)
+
+        with stats_lock:
+            stats["spot"]["total"] += 1
+            if correct:
+                stats["spot"]["correct"] += 1
+            save_stats(stats)
+            acc = accuracy_line(stats)
+
+        diff = current_price - price_at_signal
+        diff_pct = diff / price_at_signal * 100
+        diff_sign = "+" if diff >= 0 else ""
+
+        if correct:
+            verdict = "✅ <b>ОТЫГРАЛО</b>"
+        else:
+            verdict = "❌ <b>НЕ ОТЫГРАЛО</b>"
+
+        signal_label = "🟢 ПОКУПКА" if signal == "buy" else "🔴 ПРОДАЖА"
+
+        msg = (
+            f"{verdict}\n\n"
+            f"Колл: {signal_label}\n"
+            f"Цена при колле: <code>{price_at_signal:.6f}</code>\n"
+            f"Цена через {CHECK_DELAY}с:  <code>{current_price:.6f}</code>\n"
+            f"Движение: <b>{diff_sign}{diff_pct:.4f}%</b>\n\n"
+            f"📊 Точность коллов: <b>{acc}</b>"
+        )
+        send_telegram(msg)
+        print(f"[check] signal={signal} was={'correct' if correct else 'wrong'} acc={acc}")
+
+    except Exception as e:
+        print(f"[check] Error: {e}")
+
+
 # ── Сообщение ─────────────────────────────────────────────────────────────────
-
-SIGNAL_LABEL = {
-    "buy":     "🟢 ПОКУПКА",
-    "sell":    "🔴 ПРОДАЖА",
-    "balance": "⚪️ баланс",
-}
-
 
 def build_message(spot, futures, spread_pct,
                   spot_bid, spot_ask, spot_sig, spot_bid_pct, spot_ask_pct,
                   fut_bid, fut_ask, fut_sig, fut_bid_pct, fut_ask_pct,
-                  spot_prev_result, fut_prev_result, stats, now):
+                  stats, now):
 
     spread_sign  = "+" if spread_pct >= 0 else ""
     spread_arrow = "🔼" if spread_pct > 0 else ("🔽" if spread_pct < 0 else "➡️")
@@ -136,27 +159,20 @@ def build_message(spot, futures, spread_pct,
     else:
         spread_label = ""
 
-    def result_line(res):
-        if res is None:   return "  ↩️ Предыдущий колл: <i>первый</i>"
-        if res:           return "  ✅ Предыдущий колл: <b>верный</b>"
-        return               "  ❌ Предыдущий колл: <b>неверный</b>"
+    SIGNAL_LABEL = {"buy": "🟢 ПОКУПКА", "sell": "🔴 ПРОДАЖА", "balance": "⚪️ баланс"}
 
     spot_block = (
         f"<b>Спот стакан (±2%):</b>\n"
         f"  🟢 Биды: <code>${spot_bid:,.0f}</code> ({spot_bid_pct:.0f}%)\n"
         f"  🔴 Аски: <code>${spot_ask:,.0f}</code> ({spot_ask_pct:.0f}%)\n"
-        f"  → {SIGNAL_LABEL[spot_sig]}\n"
-        f"{result_line(spot_prev_result)}\n"
-        f"  📊 Точность: <b>{accuracy_line(stats, 'spot')}</b>"
+        f"  → {SIGNAL_LABEL[spot_sig]}"
     )
 
     fut_block = (
         f"<b>Фьючерс стакан (±2%):</b>\n"
         f"  🟢 Биды: <code>${fut_bid:,.0f}</code> ({fut_bid_pct:.0f}%)\n"
         f"  🔴 Аски: <code>${fut_ask:,.0f}</code> ({fut_ask_pct:.0f}%)\n"
-        f"  → {SIGNAL_LABEL[fut_sig]}\n"
-        f"{result_line(fut_prev_result)}\n"
-        f"  📊 Точность: <b>{accuracy_line(stats, 'futures')}</b>"
+        f"  → {SIGNAL_LABEL[fut_sig]}"
     )
 
     return (
@@ -165,7 +181,9 @@ def build_message(spot, futures, spread_pct,
         f"Фьючерс: <code>{futures:.6f}</code>\n"
         f"{spread_arrow} Спред: <b>{spread_sign}{spread_pct:.4f}%</b>{spread_label}\n\n"
         f"{spot_block}\n\n"
-        f"{fut_block}"
+        f"{fut_block}\n\n"
+        f"📊 Точность коллов: <b>{accuracy_line(stats)}</b>\n"
+        f"⏱ Результат через {CHECK_DELAY} сек..."
     )
 
 
@@ -175,10 +193,7 @@ def main():
     print("Starting FF spread parser...")
     stats = load_stats()
 
-    prev_spot_sig   = None
-    prev_spot_price = None
-    prev_fut_sig    = None
-    prev_fut_price  = None
+    prev_spot_sig = None
 
     while True:
         try:
@@ -193,36 +208,28 @@ def main():
             spot_sig, spot_bid_pct, spot_ask_pct = get_signal(spot_bid, spot_ask)
             fut_sig,  fut_bid_pct,  fut_ask_pct  = get_signal(fut_bid,  fut_ask)
 
-            # Триггер: сигнал спота изменился И он не "balance"
             trigger = spot_sig != "balance" and spot_sig != prev_spot_sig
 
             if trigger:
-                spot_prev_result = None
-                fut_prev_result  = None
-
-                if prev_spot_sig is not None and prev_spot_price is not None:
-                    spot_prev_result = record_result(
-                        stats, "spot", prev_spot_sig, prev_spot_price, spot)
-
-                if prev_fut_sig is not None and prev_fut_price is not None:
-                    fut_prev_result = record_result(
-                        stats, "futures", prev_fut_sig, prev_fut_price, futures)
-
                 msg = build_message(
                     spot, futures, spread_pct,
                     spot_bid, spot_ask, spot_sig, spot_bid_pct, spot_ask_pct,
                     fut_bid,  fut_ask,  fut_sig,  fut_bid_pct,  fut_ask_pct,
-                    spot_prev_result, fut_prev_result, stats, now
+                    stats, now
                 )
                 send_telegram(msg)
-                print(f"[{now}] spread={spread_pct:+.4f}% spot={spot_sig}({spot_bid_pct:.0f}%b) — отправлено")
+                print(f"[{now}] spot={spot_sig}({spot_bid_pct:.0f}%b) — отправлено, проверка через {CHECK_DELAY}с")
 
-                prev_spot_sig   = spot_sig
-                prev_spot_price = spot
-                prev_fut_sig    = fut_sig
-                prev_fut_price  = futures
+                # Запускаем проверку результата в фоне
+                threading.Thread(
+                    target=check_result,
+                    args=(spot_sig, spot, stats),
+                    daemon=True
+                ).start()
+
+                prev_spot_sig = spot_sig
             else:
-                print(f"[{now}] spread={spread_pct:+.4f}% spot={spot_sig}({spot_bid_pct:.0f}%b) fut={fut_sig} — пропущено")
+                print(f"[{now}] spot={spot_sig}({spot_bid_pct:.0f}%b) — пропущено")
 
         except requests.RequestException as e:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {e}")
