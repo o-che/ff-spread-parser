@@ -114,15 +114,17 @@ def check_result(spot_sig, spot_price, fut_sig, fut_price, stats):
             cur_spot = f_spot.result()
             cur_fut  = f_fut.result()
 
+        LABEL = {"buy": "🟢 ПОКУПКА", "sell": "🔴 ПРОДАЖА", "balance": "⚪️ баланс"}
+
         def evaluate(sig, old_p, cur_p, market):
+            if sig == "balance":
+                return None
             correct = (sig == "buy" and cur_p > old_p) or \
                       (sig == "sell" and cur_p < old_p)
             stats[market]["total"] += 1
             if correct:
                 stats[market]["correct"] += 1
             return correct
-
-        LABEL = {"buy": "🟢 ПОКУПКА", "sell": "🔴 ПРОДАЖА", "balance": "⚪️ баланс"}
 
         with stats_lock:
             spot_ok = evaluate(spot_sig, spot_price, cur_spot, "spot")
@@ -132,6 +134,8 @@ def check_result(spot_sig, spot_price, fut_sig, fut_price, stats):
             acc_fut  = accuracy_line(stats, "futures")
 
         def result_row(ok, sig, old_p, cur_p, market_name, acc):
+            if ok is None:
+                return None
             verdict = "✅ отыграло" if ok else "❌ не отыграло"
             diff_pct = (cur_p - old_p) / old_p * 100
             diff_sign = "+" if diff_pct >= 0 else ""
@@ -141,10 +145,15 @@ def check_result(spot_sig, spot_price, fut_sig, fut_price, stats):
                 f"  📊 Точность: <b>{acc}</b>"
             )
 
-        spot_row = result_row(spot_ok, spot_sig, spot_price, cur_spot, "Спот",    acc_spot)
-        fut_row  = result_row(fut_ok,  fut_sig,  fut_price,  cur_fut,  "Фьючерс", acc_fut)
+        rows = [
+            result_row(spot_ok, spot_sig, spot_price, cur_spot, "Спот",    acc_spot),
+            result_row(fut_ok,  fut_sig,  fut_price,  cur_fut,  "Фьючерс", acc_fut),
+        ]
+        rows = [r for r in rows if r]
+        if not rows:
+            return
 
-        msg = f"⏱ <b>Результат через {CHECK_DELAY}с</b>\n\n{spot_row}\n\n{fut_row}"
+        msg = f"⏱ <b>Результат через {CHECK_DELAY}с</b>\n\n" + "\n\n".join(rows)
         send_telegram(msg)
         print(f"[check] spot={'ok' if spot_ok else 'no'} fut={'ok' if fut_ok else 'no'}")
 
