@@ -15,7 +15,7 @@ FUTURES_DEPTH_URL = f"https://fapi.binance.com/fapi/v1/depth?symbol={SYMBOL}&lim
 TG_TOKEN = os.environ["TG_TOKEN"]
 TG_URL   = f"https://api.telegram.org/bot{TG_TOKEN}"
 
-SIGNAL_PCT = 60.0
+SIGNAL_PCT = 59.0
 CHECKPOINTS = [5, 15, 30, 60]   # секунд после сигнала
 
 CHANNELS = [
@@ -105,17 +105,20 @@ def analyze_book(book, mid_price, depth_pct):
     return bid_vol, ask_vol
 
 
-def get_signal(bid_vol, ask_vol):
+def book_pcts(bid_vol, ask_vol):
     total = bid_vol + ask_vol
     if total == 0:
-        return "balance", 50.0, 50.0
-    bid_pct = bid_vol / total * 100
-    ask_pct = ask_vol / total * 100
-    if bid_pct >= SIGNAL_PCT:
-        return "buy", bid_pct, ask_pct
-    elif ask_pct >= SIGNAL_PCT:
-        return "sell", bid_pct, ask_pct
-    return "balance", bid_pct, ask_pct
+        return 50.0, 50.0
+    return bid_vol / total * 100, ask_vol / total * 100
+
+
+def get_combined_signal(spot_bid_pct, spot_ask_pct, fut_bid_pct, fut_ask_pct):
+    """Колл только если и спот и фьючерс согласны (оба >= SIGNAL_PCT на одной стороне)."""
+    if spot_bid_pct >= SIGNAL_PCT and fut_bid_pct >= SIGNAL_PCT:
+        return "buy"
+    elif spot_ask_pct >= SIGNAL_PCT and fut_ask_pct >= SIGNAL_PCT:
+        return "sell"
+    return "balance"
 
 
 # ── Dynamic result tracking ───────────────────────────────────────────────────
@@ -240,13 +243,17 @@ class ChannelWorker:
         spot_bid, spot_ask = analyze_book(spot_book, spot, self.depth)
         fut_bid,  fut_ask  = analyze_book(fut_book,  futures, self.depth)
 
-        spot_sig, spot_bid_pct, spot_ask_pct = get_signal(spot_bid, spot_ask)
-        fut_sig,  fut_bid_pct,  fut_ask_pct  = get_signal(fut_bid,  fut_ask)
+        spot_bid_pct, spot_ask_pct = book_pcts(spot_bid, spot_ask)
+        fut_bid_pct,  fut_ask_pct  = book_pcts(fut_bid,  fut_ask)
+
+        combined_sig = get_combined_signal(spot_bid_pct, spot_ask_pct, fut_bid_pct, fut_ask_pct)
+        spot_sig = combined_sig
+        fut_sig  = combined_sig
 
         elapsed = time.time() - self.last_alert_time
         trigger = (
-            spot_sig != "balance"
-            and spot_sig != self.prev_spot_sig
+            combined_sig != "balance"
+            and combined_sig != self.prev_spot_sig
             and elapsed >= self.cooldown
         )
 
